@@ -11,18 +11,22 @@
 #include "simplefs.h"
 
 struct superblock {
-    struct simplefs_sb_info info;
-    char padding[4064]; /* Padding to match block size */
+    union {
+        struct simplefs_sb_info info;
+        char padding[SIMPLEFS_BLOCK_SIZE]; /* Padding to match block size */
+    };
 };
 
-/* Returns ceil(a/b) */
-static inline uint32_t idiv_ceil(uint32_t a, uint32_t b)
-{
-    uint32_t ret = a / b;
-    if (a % b)
-        return ret + 1;
-    return ret;
-}
+_Static_assert(sizeof(struct superblock) == SIMPLEFS_BLOCK_SIZE);
+
+/**
+ * DIV_ROUND_UP - round up a division
+ * @n: dividend
+ * @d: divisor
+ *
+ * Return the result of n / d, rounded up to the nearest integer.
+ */
+#define DIV_ROUND_UP(n, d) (((n) + (d) -1) / (d))
 
 static struct superblock *write_superblock(int fd, struct stat *fstats)
 {
@@ -35,9 +39,10 @@ static struct superblock *write_superblock(int fd, struct stat *fstats)
     uint32_t mod = nr_inodes % SIMPLEFS_INODES_PER_BLOCK;
     if (mod)
         nr_inodes += SIMPLEFS_INODES_PER_BLOCK - mod;
-    uint32_t nr_istore_blocks = idiv_ceil(nr_inodes, SIMPLEFS_INODES_PER_BLOCK);
-    uint32_t nr_ifree_blocks = idiv_ceil(nr_inodes, SIMPLEFS_BLOCK_SIZE * 8);
-    uint32_t nr_bfree_blocks = idiv_ceil(nr_blocks, SIMPLEFS_BLOCK_SIZE * 8);
+    uint32_t nr_istore_blocks =
+        DIV_ROUND_UP(nr_inodes, SIMPLEFS_INODES_PER_BLOCK);
+    uint32_t nr_ifree_blocks = DIV_ROUND_UP(nr_inodes, SIMPLEFS_BLOCK_SIZE * 8);
+    uint32_t nr_bfree_blocks = DIV_ROUND_UP(nr_blocks, SIMPLEFS_BLOCK_SIZE * 8);
     uint32_t nr_data_blocks =
         nr_blocks - nr_istore_blocks - nr_ifree_blocks - nr_bfree_blocks;
 
@@ -78,22 +83,23 @@ static struct superblock *write_superblock(int fd, struct stat *fstats)
 
 static int write_inode_store(int fd, struct superblock *sb)
 {
-    /* Allocate a zeroed block for inode store */
+    /* Allocate a block of zeroed-out memory space for the inode storage. */
     char *block = malloc(SIMPLEFS_BLOCK_SIZE);
     if (!block)
         return -1;
 
     memset(block, 0, SIMPLEFS_BLOCK_SIZE);
 
-    /* Root inode (inode 0) */
+    /* Root inode (inode 1) */
     struct simplefs_inode *inode = (struct simplefs_inode *) block;
     uint32_t first_data_block = 1 + le32toh(sb->info.nr_bfree_blocks) +
                                 le32toh(sb->info.nr_ifree_blocks) +
                                 le32toh(sb->info.nr_istore_blocks);
 
-    /* Use inode 1 for root.
-     * If system use glibc, readdir will skip inode 0, and vfs also avoid
-     * using inode 0
+    /* Designate inode 1 as the root inode.
+     * When the system uses the glibc, the readdir function will skip over
+     * inode 0. Additionally, the VFS layer avoids using inode 0 to prevent
+     * potential issues.
      */
     inode += 1;
     inode->i_mode = htole32(S_IFDIR | S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR |
@@ -112,7 +118,7 @@ static int write_inode_store(int fd, struct superblock *sb)
         goto end;
     }
 
-    /* Reset inode store blocks to zero */
+    /* Clear all memory blocks allocated for inode storage. */
     memset(block, 0, SIMPLEFS_BLOCK_SIZE);
     uint32_t i;
     for (i = 1; i < sb->info.nr_istore_blocks; i++) {
@@ -145,7 +151,7 @@ static int write_ifree_blocks(int fd, struct superblock *sb)
     /* Set all bits to 1 */
     memset(ifree, 0xff, SIMPLEFS_BLOCK_SIZE);
 
-    /* First ifree block, containing first used inode */
+    /* The initial ifree block holds the first inode marked as in-use. */
     ifree[0] = htole64(0xfffffffffffffffc);
     int ret = write(fd, ifree, SIMPLEFS_BLOCK_SIZE);
     if (ret != SIMPLEFS_BLOCK_SIZE) {
@@ -153,7 +159,9 @@ static int write_ifree_blocks(int fd, struct superblock *sb)
         goto end;
     }
 
-    /* All ifree blocks except the one containing 2 first inodes */
+    /* All free blocks in the inode bitmap except the one containing the first
+     * two inodes.
+     */
     ifree[0] = 0xffffffffffffffff;
     uint32_t i;
     for (i = 1; i < le32toh(sb->info.nr_ifree_blocks); i++) {
@@ -184,8 +192,9 @@ static int write_bfree_blocks(int fd, struct superblock *sb)
         return -1;
     uint64_t *bfree = (uint64_t *) block;
 
-    /* First blocks (incl. sb + istore + ifree + bfree + 1 used block)
-     * we suppose it won't go further than the first block
+    /* The first blocks refer to the superblock (metadata about the fs), inode
+     * store (where inode data is stored), ifree (list of free inodes), bfree
+     * (list of free data blocks), and one data block marked as used.
      */
     memset(bfree, 0xff, SIMPLEFS_BLOCK_SIZE);
     uint32_t i = 0;
@@ -226,7 +235,20 @@ end:
 
 static int write_data_blocks(int fd, struct superblock *sb)
 {
-    /* FIXME: unimplemented */
+    char *buffer = calloc(1, SIMPLEFS_BLOCK_SIZE);
+    if (!buffer) {
+        perror("Failed to allocate memory");
+        return -1;
+    }
+
+    ssize_t ret = write(fd, buffer, SIMPLEFS_BLOCK_SIZE);
+    if (ret != SIMPLEFS_BLOCK_SIZE) {
+        perror("Failed to write data block");
+        free(buffer);
+        return -1;
+    }
+
+    free(buffer);
     return 0;
 }
 
@@ -265,9 +287,9 @@ int main(int argc, char **argv)
         stat_buf.st_size = blk_size;
     }
 
-    /* Check if image is large enough */
+    /* Verify if the file system image has sufficient size. */
     long int min_size = 100 * SIMPLEFS_BLOCK_SIZE;
-    if (stat_buf.st_size <= min_size) {
+    if (stat_buf.st_size < min_size) {
         fprintf(stderr, "File is not large enough (size=%ld, min size=%ld)\n",
                 stat_buf.st_size, min_size);
         ret = EXIT_FAILURE;
@@ -306,7 +328,7 @@ int main(int argc, char **argv)
         goto free_sb;
     }
 
-    /* Write data blocks */
+    /* clear a root index block */
     ret = write_data_blocks(fd, sb);
     if (ret) {
         perror("write_data_blocks():");

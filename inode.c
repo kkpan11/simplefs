@@ -11,7 +11,15 @@
 static const struct inode_operations simplefs_inode_ops;
 static const struct inode_operations symlink_inode_ops;
 
-/* Get inode ino from disk */
+/* Either return the inode that corresponds to a given inode number (ino), if
+ * it is already in the cache, or create a new inode object if it is not in the
+ * cache.
+ *
+ * Note that this function is very similar to simplefs_new_inode, except that
+ * the requested inode is supposed to be allocated on-disk already. So do not
+ * use this to create a completely new inode that has not been allocated on
+ * disk.
+ */
 struct inode *simplefs_iget(struct super_block *sb, unsigned long ino)
 {
     struct inode *inode = NULL;
@@ -56,17 +64,23 @@ struct inode *simplefs_iget(struct super_block *sb, unsigned long ino)
     i_gid_write(inode, le32_to_cpu(cinode->i_gid));
     inode->i_size = le32_to_cpu(cinode->i_size);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 6, 0)
     inode_set_ctime(inode, (time64_t) le32_to_cpu(cinode->i_ctime), 0);
 #else
     inode->i_ctime.tv_sec = (time64_t) le32_to_cpu(cinode->i_ctime);
     inode->i_ctime.tv_nsec = 0;
 #endif
 
+#if SIMPLEFS_AT_LEAST(6, 7, 0)
+    inode_set_atime(inode, (time64_t) le32_to_cpu(cinode->i_atime), 0);
+    inode_set_mtime(inode, (time64_t) le32_to_cpu(cinode->i_mtime), 0);
+#else
     inode->i_atime.tv_sec = (time64_t) le32_to_cpu(cinode->i_atime);
     inode->i_atime.tv_nsec = 0;
     inode->i_mtime.tv_sec = (time64_t) le32_to_cpu(cinode->i_mtime);
     inode->i_mtime.tv_nsec = 0;
+#endif
+
     inode->i_blocks = le32_to_cpu(cinode->i_blocks);
     set_nlink(inode, le32_to_cpu(cinode->i_nlink));
 
@@ -96,7 +110,7 @@ failed:
     return ERR_PTR(ret);
 }
 
-/* Searches for a dentry in dir.
+/* Search for a dentry in dir.
  * Fills dentry with NULL if not found in dir, or with the corresponding inode
  * if found.
  * Returns NULL on success, indicating the dentry was successfully filled or
@@ -161,7 +175,12 @@ search_end:
     brelse(bh);
 
     /* Update directory access time */
+#if SIMPLEFS_AT_LEAST(6, 7, 0)
+    inode_set_atime_to_ts(dir, current_time(dir));
+#else
     dir->i_atime = current_time(dir);
+#endif
+
     mark_inode_dirty(dir);
 
     /* Fill the dentry with the inode */
@@ -170,7 +189,17 @@ search_end:
     return NULL;
 }
 
-/* Create a new inode in dir */
+/* Find and construct a new inode.
+ *
+ * @dir: the inode of the parent directory where the new inode is supposed to
+ *       be attached to.
+ * @mode: the mode information of the new inode
+ *
+ * This is a helper function for the inode operation "create" (implemented in
+ * simplefs_create()). It takes care of reserving an inode block on disk (by
+ * modifying the inode bitmap), creating a VFS inode object (in memory), and
+ * attaching filesystem-specific information to that VFS inode.
+ */
 static struct inode *simplefs_new_inode(struct inode *dir, mode_t mode)
 {
     struct inode *inode;
@@ -180,7 +209,7 @@ static struct inode *simplefs_new_inode(struct inode *dir, mode_t mode)
     uint32_t ino, bno;
     int ret;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 6, 0) && SIMPLEFS_LESS_EQUAL(6, 7, 0)
     struct timespec64 cur_time;
 #endif
 
@@ -210,16 +239,18 @@ static struct inode *simplefs_new_inode(struct inode *dir, mode_t mode)
     }
 
     if (S_ISLNK(mode)) {
-#if MNT_IDMAP_REQUIRED()
+#if SIMPLEFS_AT_LEAST(6, 3, 0)
         inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
-#elif USER_NS_REQUIRED()
+#elif SIMPLEFS_AT_LEAST(5, 12, 0)
         inode_init_owner(&init_user_ns, inode, dir, mode);
 #else
         inode_init_owner(inode, dir, mode);
 #endif
         set_nlink(inode, 1);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 7, 0)
+        simple_inode_init_ts(inode);
+#elif SIMPLEFS_AT_LEAST(6, 6, 0)
         cur_time = current_time(inode);
         inode->i_atime = inode->i_mtime = cur_time;
         inode_set_ctime_to_ts(inode, cur_time);
@@ -233,16 +264,16 @@ static struct inode *simplefs_new_inode(struct inode *dir, mode_t mode)
     ci = SIMPLEFS_INODE(inode);
 
     /* Get a free block for this new inode's index */
-    bno = get_free_blocks(sbi, 1);
+    bno = get_free_blocks(sb, 1);
     if (!bno) {
         ret = -ENOSPC;
         goto put_inode;
     }
 
     /* Initialize inode */
-#if MNT_IDMAP_REQUIRED()
+#if SIMPLEFS_AT_LEAST(6, 3, 0)
     inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
-#elif USER_NS_REQUIRED()
+#elif SIMPLEFS_AT_LEAST(5, 12, 0)
     inode_init_owner(&init_user_ns, inode, dir, mode);
 #else
     inode_init_owner(inode, dir, mode);
@@ -261,7 +292,9 @@ static struct inode *simplefs_new_inode(struct inode *dir, mode_t mode)
         set_nlink(inode, 1);
     }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 7, 0)
+    simple_inode_init_ts(inode);
+#elif SIMPLEFS_AT_LEAST(6, 6, 0)
     cur_time = current_time(inode);
     inode->i_atime = inode->i_mtime = cur_time;
     inode_set_ctime_to_ts(inode, cur_time);
@@ -285,13 +318,13 @@ put_ino:
  *   - cleanup index block of the new inode
  *   - add new file/directory in parent index
  */
-#if MNT_IDMAP_REQUIRED()
+#if SIMPLEFS_AT_LEAST(6, 3, 0)
 static int simplefs_create(struct mnt_idmap *id,
                            struct inode *dir,
                            struct dentry *dentry,
                            umode_t mode,
                            bool excl)
-#elif USER_NS_REQUIRED()
+#elif SIMPLEFS_AT_LEAST(5, 12, 0)
 static int simplefs_create(struct user_namespace *ns,
                            struct inode *dir,
                            struct dentry *dentry,
@@ -312,10 +345,9 @@ static int simplefs_create(struct inode *dir,
     char *fblock;
     struct buffer_head *bh, *bh2;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 6, 0) && SIMPLEFS_LESS_EQUAL(6, 7, 0)
     struct timespec64 cur_time;
 #endif
-
     int ret = 0, alloc = false, bno = 0;
     int ei = 0, bi = 0, fi = 0;
 
@@ -363,7 +395,7 @@ static int simplefs_create(struct inode *dir,
     fi = eblock->nr_files % SIMPLEFS_FILES_PER_BLOCK;
 
     if (!eblock->extents[ei].ee_start) {
-        bno = get_free_blocks(SIMPLEFS_SB(sb), 8);
+        bno = get_free_blocks(sb, 8);
         if (!bno) {
             ret = -ENOSPC;
             goto iput;
@@ -395,7 +427,9 @@ static int simplefs_create(struct inode *dir,
     /* Update stats and mark dir and new inode dirty */
     mark_inode_dirty(inode);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 7, 0)
+    simple_inode_init_ts(dir);
+#elif SIMPLEFS_AT_LEAST(6, 6, 0)
     cur_time = current_time(dir);
     dir->i_mtime = dir->i_atime = cur_time;
     inode_set_ctime_to_ts(dir, cur_time);
@@ -520,7 +554,7 @@ static int simplefs_unlink(struct inode *dir, struct dentry *dentry)
     struct inode *inode = d_inode(dentry);
     struct buffer_head *bh = NULL, *bh2 = NULL;
     struct simplefs_file_ei_block *file_block = NULL;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 6, 0) && SIMPLEFS_LESS_EQUAL(6, 7, 0)
     struct timespec64 cur_time;
 #endif
     int ei = 0, bi = 0;
@@ -537,7 +571,9 @@ static int simplefs_unlink(struct inode *dir, struct dentry *dentry)
         goto clean_inode;
 
         /* Update inode stats */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 7, 0)
+    simple_inode_init_ts(dir);
+#elif SIMPLEFS_AT_LEAST(6, 6, 0)
     cur_time = current_time(dir);
     dir->i_mtime = dir->i_atime = cur_time;
     inode_set_ctime_to_ts(dir, cur_time);
@@ -606,13 +642,18 @@ clean_inode:
     i_gid_write(inode, 0);
     inode->i_mode = 0;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 7, 0)
+    inode_set_mtime(inode, 0, 0);
+    inode_set_atime(inode, 0, 0);
+    inode_set_ctime(inode, 0, 0);
+#elif SIMPLEFS_AT_LEAST(6, 6, 0)
     inode->i_mtime.tv_sec = inode->i_atime.tv_sec = 0;
     inode_set_ctime(inode, 0, 0);
 #else
     inode->i_ctime.tv_sec = inode->i_mtime.tv_sec = inode->i_atime.tv_sec = 0;
 #endif
 
+    inode_dec_link_count(inode);
     drop_nlink(inode);
     mark_inode_dirty(inode);
 
@@ -623,14 +664,14 @@ clean_inode:
     return ret;
 }
 
-#if MNT_IDMAP_REQUIRED()
+#if SIMPLEFS_AT_LEAST(6, 3, 0)
 static int simplefs_rename(struct mnt_idmap *id,
                            struct inode *old_dir,
                            struct dentry *old_dentry,
                            struct inode *new_dir,
                            struct dentry *new_dentry,
                            unsigned int flags)
-#elif USER_NS_REQUIRED()
+#elif SIMPLEFS_AT_LEAST(5, 12, 0)
 static int simplefs_rename(struct user_namespace *ns,
                            struct inode *old_dir,
                            struct dentry *old_dentry,
@@ -652,7 +693,7 @@ static int simplefs_rename(struct inode *old_dir,
     struct simplefs_file_ei_block *eblock_new = NULL;
     struct simplefs_dir_block *dblock = NULL;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 6, 0) && SIMPLEFS_LESS_EQUAL(6, 7, 0)
     struct timespec64 cur_time;
 #endif
 
@@ -722,7 +763,7 @@ static int simplefs_rename(struct inode *old_dir,
     /* insert in new parent directory */
     /* Get new freeblocks for extent if needed*/
     if (new_pos < 0) {
-        bno = get_free_blocks(SIMPLEFS_SB(sb), 8);
+        bno = get_free_blocks(sb, 8);
         if (!bno) {
             ret = -ENOSPC;
             goto release_new;
@@ -749,7 +790,9 @@ static int simplefs_rename(struct inode *old_dir,
     brelse(bh2);
 
     /* Update new parent inode metadata */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 7, 0)
+    simple_inode_init_ts(new_dir);
+#elif SIMPLEFS_AT_LEAST(6, 6, 0)
     cur_time = current_time(new_dir);
     new_dir->i_atime = new_dir->i_mtime = cur_time;
     inode_set_ctime_to_ts(new_dir, cur_time);
@@ -768,7 +811,9 @@ static int simplefs_rename(struct inode *old_dir,
         goto release_new;
 
         /* Update old parent inode metadata */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if SIMPLEFS_AT_LEAST(6, 7, 0)
+    simple_inode_init_ts(old_dir);
+#elif SIMPLEFS_AT_LEAST(6, 6, 0)
     cur_time = current_time(old_dir);
     old_dir->i_atime = old_dir->i_mtime = cur_time;
     inode_set_ctime_to_ts(old_dir, cur_time);
@@ -794,7 +839,7 @@ release_new:
     return ret;
 }
 
-#if MNT_IDMAP_REQUIRED()
+#if SIMPLEFS_AT_LEAST(6, 3, 0)
 static int simplefs_mkdir(struct mnt_idmap *id,
                           struct inode *dir,
                           struct dentry *dentry,
@@ -802,7 +847,7 @@ static int simplefs_mkdir(struct mnt_idmap *id,
 {
     return simplefs_create(id, dir, dentry, mode | S_IFDIR, 0);
 }
-#elif USER_NS_REQUIRED()
+#elif SIMPLEFS_AT_LEAST(5, 12, 0)
 static int simplefs_mkdir(struct user_namespace *ns,
                           struct inode *dir,
                           struct dentry *dentry,
@@ -874,7 +919,7 @@ static int simplefs_link(struct dentry *old_dentry,
     fi = eblock->nr_files % SIMPLEFS_FILES_PER_BLOCK;
 
     if (eblock->extents[ei].ee_start == 0) {
-        bno = get_free_blocks(SIMPLEFS_SB(sb), 8);
+        bno = get_free_blocks(sb, 8);
         if (!bno) {
             ret = -ENOSPC;
             goto end;
@@ -919,12 +964,12 @@ end:
     return ret;
 }
 
-#if MNT_IDMAP_REQUIRED()
+#if SIMPLEFS_AT_LEAST(6, 3, 0)
 static int simplefs_symlink(struct mnt_idmap *id,
                             struct inode *dir,
                             struct dentry *dentry,
                             const char *symname)
-#elif USER_NS_REQUIRED()
+#elif SIMPLEFS_AT_LEAST(5, 12, 0)
 static int simplefs_symlink(struct user_namespace *ns,
                             struct inode *dir,
                             struct dentry *dentry,
@@ -967,7 +1012,7 @@ static int simplefs_symlink(struct inode *dir,
     fi = eblock->nr_files % SIMPLEFS_FILES_PER_BLOCK;
 
     if (eblock->extents[ei].ee_start == 0) {
-        bno = get_free_blocks(SIMPLEFS_SB(sb), 8);
+        bno = get_free_blocks(sb, 8);
         if (!bno) {
             ret = -ENOSPC;
             goto end;
